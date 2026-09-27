@@ -7,6 +7,7 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,13 +26,15 @@ public class VoiceServerHandler extends AbstractWebSocketHandler {
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         String clientIp = session.getRemoteAddress().getAddress().getHostAddress();
 
-        // Kiểm tra xem IP có nằm trong danh sách cấm hay không
         if (bannedIps.contains(clientIp)) {
             session.sendMessage(new TextMessage("BANNED"));
             session.close();
             if (gui != null) gui.log("Từ chối kết nối từ IP bị Cấm: " + clientIp);
             return;
         }
+
+        // Tăng giới hạn kích thước gói tin Binary cho Session
+        session.setBinaryMessageSizeLimit(64 * 1024);
 
         activeSessions.put(session.getId(), session);
         if (gui != null) {
@@ -42,12 +45,25 @@ public class VoiceServerHandler extends AbstractWebSocketHandler {
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
+        // Trích xuất dữ liệu âm thanh ra mảng byte độc lập để tránh trôi con trỏ ByteBuffer
+        ByteBuffer payload = message.getPayload();
+        byte[] audioData = new byte[payload.remaining()];
+        payload.get(audioData);
+
+        if (audioData.length == 0) return;
+
+        // Broadcast dữ liệu âm thanh tới các Client còn lại
         for (WebSocketSession s : activeSessions.values()) {
             if (s.isOpen() && !s.getId().equals(session.getId())) {
-                synchronized (s) { // Khóa session để tránh xung đột ghi dữ liệu đa luồng
+                synchronized (s) {
                     try {
-                        s.sendMessage(message);
-                    } catch (IOException ignored) {}
+                        // Tạo đối tượng BinaryMessage mới từ mảng byte đã chép
+                        s.sendMessage(new BinaryMessage(audioData));
+                    } catch (Exception e) {
+                        if (gui != null) {
+                            gui.log("Lỗi chuyển tiếp voice tới [ID: " + s.getId() + "]: " + e.getMessage());
+                        }
+                    }
                 }
             }
         }
@@ -62,12 +78,11 @@ public class VoiceServerHandler extends AbstractWebSocketHandler {
         }
     }
 
-    // Hàm gọi khi Admin bấm nút BAN / KICK trên Server GUI
     public static void banClient(String sessionId) {
         WebSocketSession session = activeSessions.get(sessionId);
         if (session != null) {
             String clientIp = session.getRemoteAddress().getAddress().getHostAddress();
-            bannedIps.add(clientIp); // Thêm IP vào danh sách đen
+            bannedIps.add(clientIp);
 
             try {
                 session.sendMessage(new TextMessage("KICKED"));
